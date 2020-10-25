@@ -334,3 +334,23 @@ def uniform_quantize(array, levels):
         array[np.logical_and(array >= bottom_level, array < top_level)] = bottom_level
         top_level = bottom_level
 
+def vector_quantize(vectors, codebook):
+    """
+    Quantize vectors using the closest vector in codebook using L2
+    
+    Parameters
+    ----------
+    vectors : decimal, [n_data, n_features]
+        Input vectors to be quantized; this is directly modified
+
+    codebook : decimal, [n_vectors, n_features]
+        Codebook of vectors
+
+    Returns
+    -------
+    closest_vec_idx : int, [n_data,]
+        Index of the closest bector in the codebook to the input example
+    """
+    dist_matrix = np.linalg.norm(vectors[:, np.newaxis, :] - codebook[np.newaxis, :, :], axis=2)
+    arg_min = np.argmin(dist_matrix, axis=1)
+    return arg_min

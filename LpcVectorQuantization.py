@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import time
 import random
 import scipy.stats as scistats
+from sklearn.cluster import KMeans
 
 # Internal
 import audio_processing as ap
@@ -29,7 +30,6 @@ lpc_order = 10  # decreasing will make excitation signal approach speech signal
 frame_time = 20e-3
 overlap_time = 10e-3
 n_quantize_bits_lpcc = 14  # number of bits per LPCC
-n_quantize_bits_exc = 12  # number of bits per LPC
 
 # %% Encoder
 # Data transmitted to decoder
@@ -58,13 +58,32 @@ for ii, filename in enumerate(files):
     TransmitData['lpccs'].append(lpccs)
     TransmitData['excitations'].append(excitation)
 
+# %% Cluster to find Vectors for Codebook
+excitations_array = np.concatenate(TransmitData['excitations'], axis=0)
+
+n_vq_quant_bits = 10
+n_vectors = 2**n_vq_quant_bits  # num vectors in codebook; power of 2
+
+print('Clustering to find codebook vectors...')
+kmeans = KMeans(n_clusters=n_vectors).fit(excitations_array)
+print('Done clustering')
+
+codebook = kmeans.cluster_centers_  # [n_vectors, lpc_order + frame_len]
+i_vec = 0
+
+plt.figure(1, clear=True)
+plt.plot(codebook[i_vec, :])
+plt.xlabel('Sample Index')
+plt.ylabel('Value')
+plt.title('Codebook Excitation Vector #%d' % (i_vec))
+plt.grid(True)
+
 # %% Quantize LPCCs and Residual
 # Original data
 orig_signals_array = np.concatenate(OrigData['signals'], axis=0)
 
 # LPC data
 lpccs_array = np.concatenate(TransmitData['lpccs'], axis=0).flatten()
-excitations_array = np.concatenate(TransmitData['excitations'], axis=0).flatten()
 
 # LPCs
 coeff_max = lpccs_array.max()
@@ -73,18 +92,17 @@ coeff_levels = ap.get_uniform_quantize_levels(vmax=coeff_max,
                                               vmin=coeff_min,
                                               n_bits=n_quantize_bits_lpcc)
 
-# Excitation
-exc_max = excitations_array.max()
-exc_min = excitations_array.min()
-exc_levels = ap.get_uniform_quantize_levels(vmax=exc_max,
-                                            vmin=exc_min,
-                                            n_bits=n_quantize_bits_exc)
-
-for ii, (coeffs, excitation) in enumerate(zip(TransmitData['lpccs'],
-                                              TransmitData['excitations'])):
+codebook_vec_count = np.zeros((n_vectors,))
+for ii in range(n_files):
     print('\rQuantizing Signal ' + str(ii + 1) + '/' + str(n_files), end='')
-    ap.uniform_quantize(array=coeffs, levels=coeff_levels)
-    ap.uniform_quantize(array=excitation, levels=exc_levels)
+
+    ap.uniform_quantize(array=TransmitData['lpccs'][ii], levels=coeff_levels)
+    closest_idx = ap.vector_quantize(vectors=TransmitData['excitations'][ii], codebook=codebook)
+    TransmitData['excitations'][ii] = codebook[closest_idx, :]
+    
+    # Count how many times each vector is used
+    for jj in range(n_vectors):
+        codebook_vec_count[jj] += (closest_idx == jj).sum()
 
 # %% Compute Entropy; Determine Optimal Compression Rate
 print('\n*** ENTROPIES ***')
@@ -92,7 +110,8 @@ print('\n*** ENTROPIES ***')
 unique_vals, rel_freqs = stats.get_rel_freqs(orig_signals_array)
 n_zero = 2**n_quantize_bits_orig - rel_freqs.shape[0]  # values with 0 frequency
 orig_entropy = scistats.entropy(pk=np.concatenate((rel_freqs, np.zeros((n_zero,))), axis=0))
-print('Entropy of Original Speech Signal: %.3f bits/sample' % orig_entropy)
+print('\n=== Original Speech Signal ===')
+print('Original # Bits: %d\nEntropy: %.3f bits/sample' % (n_quantize_bits_orig, orig_entropy))
 
 plt.figure(12, clear=True)
 plt.plot(unique_vals, rel_freqs)
@@ -102,17 +121,18 @@ plt.title('Relative Frequencies of Original Signal Values')
 plt.grid(True)
 
 # Excitations
-excitations_array = np.concatenate(TransmitData['excitations'], axis=0)
-unique_vals, rel_freqs = stats.get_rel_freqs(excitations_array)
-n_zero = 2**n_quantize_bits_exc - rel_freqs.shape[0]  # values with 0 frequency
-exc_entropy = scistats.entropy(pk=np.concatenate((rel_freqs, np.zeros((n_zero,))), axis=0))
-print('Entropy of Excitation Signal: %.3f bits/sample' % exc_entropy)
+n_frames = excitations_array.shape[0]
+codebook_rel_freqs = codebook_vec_count / n_frames
+vq_entropy = scistats.entropy(pk=codebook_rel_freqs)
+print('\n=== Vector Quantized Index ===')
+print('Original # Bits: %d\nEntropy: %.3f bits/sample' % (n_vq_quant_bits, vq_entropy))
 
 plt.figure(13, clear=True)
-plt.plot(unique_vals, rel_freqs)
-plt.xlabel('Value')
+sort_idx = np.argsort(codebook_rel_freqs)
+plt.plot(codebook_rel_freqs[sort_idx])
+plt.xlabel('Codebook Index')
 plt.ylabel('Relative Frequency')
-plt.title('Relative Frequencies of Quantized Excitation Signal Values')
+plt.title('Sorted Relative Frequencies of Quantized Excitation Signal Values')
 plt.grid(True)
 
 # LPCCs
@@ -120,7 +140,8 @@ lpccs_array = np.concatenate(TransmitData['lpccs'], axis=0).flatten()
 unique_vals, rel_freqs = stats.get_rel_freqs(lpccs_array)
 n_zero = 2**n_quantize_bits_lpcc - rel_freqs.shape[0]  # values with 0 frequency
 lpcc_entropy = scistats.entropy(pk=np.concatenate((rel_freqs, np.zeros((n_zero,))), axis=0))
-print('Entropy of LPCCs: %.3f bits/coeff' % lpcc_entropy)
+print('\n=== LPCCs ===')
+print('Original # Bits: %d\nEntropy: %.3f bits/sample' % (n_quantize_bits_lpcc, lpcc_entropy))
 
 plt.figure(14, clear=True)
 plt.plot(unique_vals, rel_freqs)
@@ -141,7 +162,7 @@ for ii, filename in enumerate(files):
     ReconstructData['signals'].append(reconstruct_sig.flatten())  # still zero-padded; must adjust to compare to original
 
 # %% Analyze Reconstruction Error
-is_hear_reconstruct = False  # listen to every Nth speaker reconstructed
+is_hear_reconstruct = True  # listen to every Nth speaker reconstructed
 is_show_reconstruct = False  # show reconstruction plot
 n_listens = 1  # how many random reconstructions to play
 random_listens = np.random.randint(low=0, high=n_files, size=(n_listens,))
@@ -182,44 +203,4 @@ for ii, (reconstruct_sig, orig_sig) in enumerate(zip(ReconstructData['signals'],
         sd.play(reconstruct_sig[:n_samps], samplerate=samp_rate)
         time.sleep(1.1*time_play)
 
-print('Reconstruction Mean Squared Error: %.3e' % (squared_err/n_tot_samps))
-
-# %% RESULTS
-# It appears reconstruction error > 1e-4 sounds bad
-# USE: 12 bit for excitation
-#      14 bit for LPCs? 
-
-# Weird because lowering LPCs makes reconstruction error way worse but sounds fine still
-# While decreasing excitation bits leaves reconstruction fine but sounds horrible
-
-# ******************
-# LPC nBits: 16
-# Excitation nBits: 12
-# Squared Error: 422.5252089736769
-# LPC Base Error: 6.830434421616783e-05
-# Original Data Rate: 256000 bps
-# LPC Base Data Rate: 206000.0 bps
-
-# ******************
-# LPC nBits: 16
-# Excitation nBits: 11
-# Squared Error: 1546.358502166903
-# LPC Base Error: 0.000249980358971164
-# Original Data Rate: 256000 bps
-# LPC Base Data Rate: 189500.0 bps
-
-# # ******************
-# # LPC nBits: 12
-# # Excitation nBits: 12
-# # Squared Error: 585977534.5314329
-# # LPC Base Error: 94.72762895922237
-# # Original Data Rate: 256000 bps
-# # LPC Base Data Rate: 204000.0 bps
-
-# ******************
-# LPC nBits: 14
-# Excitation nBits: 12
-# Squared Error: 842.0827754085831
-# LPC Base Error: 0.00013612894693248266
-# Original Data Rate: 256000 bps
-# LPC Base Data Rate: 205000.0 bps
+print('\n\nReconstruction Mean Squared Error: %.3e' % (squared_err/n_tot_samps))
