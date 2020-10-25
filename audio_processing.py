@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Functions to assist with speech and other audio processing
-
-@author: ktopo
 """
 # External
 import numpy as np
@@ -140,25 +138,18 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
         fit_data = data[fit_st:fit_end]
 
         # %% Get Autocorrelation and solve for LPCs
-        # Window, get autocorr matrix and solve for coeffs
-        # fit_data *= sig.windows.hamming(n_samps_fit)
-
         corr_half_idx = fit_data.shape[0] // 2
         corr = sig.correlate(in1=fit_data,
                              in2=fit_data,
                              mode='same')[corr_half_idx:]
         c = corr[:lpc_order]  # col and row of autocorr toeplitz matrix
-        r = c
         b = corr[1:lpc_order+1]
 
-        # Method 1) Use pseudo-inverse since solve_toeplitz becomes singular
+        # Use pseudo-inverse since solve_toeplitz becomes singular
+        # Using Levinson-Durbin solving got singular matrix error
         auto_corr = scilin.toeplitz(c)
         auto_corr_inv = np.linalg.pinv(auto_corr)
         x = np.matmul(auto_corr_inv, b)
-        
-        # Method 2) Levinson Durbin algorithm; errors out and says data singular
-        # x = scilin.solve_toeplitz((c, r), b)
-
         coeffs[ifr, :] = x  # -a1 ... -aN in vocal tract all-pole filter
 
         # %% Inverse filter or residual for excitation signal
@@ -166,21 +157,13 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
         frame_end = frame_end_vec[ifr]
 
         s = data[frame_st - lpc_order:frame_end]  # True speech signal for frame (take lpc_order extra for prediction)
-        # num = np.flip(np.concatenate((np.array([0]), x), axis=0), axis=0) # y(n) = 0x(n) + a1x(n-1) + a2x(n-2) + ...
         num = np.concatenate((np.array([0]), x), axis=0) # y(n) = 0x(n) + a1x(n-1) + a2x(n-2) + ...
         den = np.array([1])
         s_hat = sig.lfilter(b=num, a=den, x=s)
 
-        # Debug
-        exc_sig_per_frame[ifr, :] = s - s_hat
-
-        # first lpc_order predictions are not good since insufficient data
-        s_hat = s_hat[lpc_order:]
-        s = s[lpc_order:]
         exc_sig = s - s_hat
-        
-        excitation_signal[frame_st:frame_end] = exc_sig
-        
+        exc_sig_per_frame[ifr, :] = exc_sig
+
         # %% Get gain and pitch? TODO
         n_exc_samps = exc_sig.shape[0]
         corr_half_idx = n_exc_samps // 2
@@ -188,7 +171,8 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
         t_axis = np.arange(n_exc_samps // 2)
         
         gain = np.linalg.norm(exc_corr, axis=0)
-        
+
+        # %% Debug
         is_debug = False
         if is_debug:
             plt.figure(num=4, clear=True)
@@ -198,8 +182,7 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
             plt.ylabel('Value')
             plt.show()
             plt.pause(1.0)
-        
-        # %% Debug
+
         # plot prediction
         is_debug = False
         if is_debug:
@@ -230,16 +213,14 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
         # plot residual passing through vocal tract filter
         is_debug = False
         if is_debug:
+            # first lpc_order predictions are not good since insufficient data
             vocal_filt_num = np.array([1])
             vocal_filt_den = np.concatenate((np.array([1]), -x), axis=0)
-            
-            # TODO-KT: do i need to take lpc_order extra samples of exc_sig?
-            reconstruct = sig.lfilter(b=vocal_filt_num, a=vocal_filt_den, x=exc_sig_per_frame[ifr, :])
-            reconstruct = reconstruct[lpc_order:]
+            reconstruct = sig.lfilter(b=vocal_filt_num, a=vocal_filt_den, x=exc_sig)
 
             plt.figure(3, clear=True)
-            plt.plot(reconstruct, 'r-o', label='Reconstruction', fillstyle='none')
-            plt.plot(s, 'b-.', label='Actual')
+            plt.plot(reconstruct[lpc_order:], 'r-o', label='Reconstruction', fillstyle='none')
+            plt.plot(s[lpc_order:], 'b-.', label='Actual')
             plt.xlabel('Sample Index')
             plt.ylabel('Voltage')
             plt.title('Reconstruction vs. Actual - Frame ' + str(ifr))
@@ -296,7 +277,34 @@ def reconstruct_lpc(exc_sig_per_frame, lpc_coeffs, frame_len, overlap_len):
         reconstruct_sig[ifr, :] = reconstruct[lpc_order:]
     return reconstruct_sig
 
-def uniform_quantize(array, vmax, vmin, n_bits):
+
+def get_uniform_quantize_levels(vmax, vmin, n_bits):
+    """
+    Returns the values of each quantization level for uniform quantization
+    
+    Parameters
+    ----------
+    vmax : decimal, scalar
+        Maximum quantization value
+
+    vmin : decimal, scalar
+        Minimum quantization value
+
+    n_bits : int, scalar
+        Number of bits to use for quantization
+
+    Returns
+    -------
+    levels : decimal, [2*n_bits,]
+        Values of quantization levels
+    """
+    n_levels = 2**n_bits
+    step = (vmax - vmin) / n_levels
+    levels = np.flip(np.arange(start=vmin, stop=vmax, step=step), axis=0)  # descending
+    return levels
+    
+    
+def uniform_quantize(array, levels):
     """
     # FIX-KT: Totally broken!
     Quantize array of data uniformly using the parameters given in input
@@ -306,21 +314,21 @@ def uniform_quantize(array, vmax, vmin, n_bits):
     array : decimal, [...]
         Array of data directly changed
 
-    vmax : decimal, scalar
-        Maximum quantization level
-
-    vmin : decimal, scalar
-        Minimum quantization level
-
-    n_bits : int
-        Number of bits used for quantization
+    levels : decimal, [2*n_bits,]
+        Values of quantization levels
 
     Returns
     -------
+    quantized : decimal, [...]
+        Quantized array
     """
-    n_levels = 2**n_bits
-    step = (vmax - vmin) / n_levels
-    levels = np.flip(np.arange(start=vmin, stop=vmax, step=step), axis=0)  # descending
+    # Takes too long
+    # orig_shape = array.shape
+    # dist = array.reshape(np.prod(orig_shape), 1) - levels[np.newaxis, :]
+    # min_idx = np.argmin(np.abs(dist), axis=1)  # round to closest level
+    # quantized = levels[min_idx].reshape(orig_shape)
+    
+    # Faster way
     top_level = np.inf
     for bottom_level in levels:
         array[np.logical_and(array >= bottom_level, array < top_level)] = bottom_level

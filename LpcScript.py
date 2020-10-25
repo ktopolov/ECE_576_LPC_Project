@@ -9,36 +9,40 @@ import sounddevice as sd
 import matplotlib.pyplot as plt
 import time
 import random
+import scipy.stats as scistats
 
 # Internal
 import audio_processing as ap
+import stats as stats
 
 # %% Read File
 path = 'C:\\Users\\ktopo\\Desktop\\School\\Courses\\Masters\\ECE 576 - Information Engineering\\Project\\sample_voice_data-master\\sample_voice_data-master\\females'
 files = os.listdir(path)
 random.shuffle(files)
 
-print('***************')
 n_files = 51  # numebr of files to load
 files = files[:n_files]
+n_quantize_bits_orig = 16
 
 # Configure LPC
 lpc_order = 10  # decreasing will make excitation signal approach speech signal
 frame_time = 20e-3
 overlap_time = 10e-3
+n_quantize_bits_lpcc = 14  # number of bits per LPCC
+n_quantize_bits_exc = 12  # number of bits per LPC
 
 # %% Encoder
 # Data transmitted to decoder
-TransmitData = {'lpc_coeffs': [],
-                'excitation_sigs': []}
-orig_sigs = []
-orig_data_rate = np.zeros((n_files,))
+OrigData = {'signals': []}
+TransmitData = {'lpccs': [],
+                'excitations': []}
 
+print('***************')
 for ii, filename in enumerate(files):
     print('\rEncoding File ' + str(ii + 1) + '/' + str(n_files), end='')
     file = os.path.join(path, filename)
     data, samp_rate = ap.read_wave(file)
-    orig_sigs.append(data)
+    OrigData['signals'].append(data)
 
     # Compute frame size
     samp_period = 1/samp_rate
@@ -46,111 +50,125 @@ for ii, filename in enumerate(files):
     overlap_len = int(overlap_time / samp_period)
 
     # Compute LPCs and excitation using baseline method
-    lpc_coeffs, exc_sig_per_frame, gain = ap.lpc(data=data, lpc_order=lpc_order,
-                                                 frame_len=frame_len,
-                                                 overlap_len=overlap_len)
+    lpccs, excitation, _ = ap.lpc(data=data, lpc_order=lpc_order,
+                                  frame_len=frame_len,
+                                  overlap_len=overlap_len)
 
     # OUTPUTS
-    TransmitData['lpc_coeffs'].append(lpc_coeffs)
-    TransmitData['excitation_sigs'].append(exc_sig_per_frame)
-
-# %% View distribution of coefficients and excitation signal
-# Coefficients (all together; independent would be more efficient)
-lpc_coeff_array = np.concatenate(TransmitData['lpc_coeffs'], axis=0)
-
-n_levels = 16  # only for plotting
-plt.figure(10, clear=True)
-plt.hist(lpc_coeff_array.flatten(), bins=n_levels)
-plt.xlabel('Value')
-plt.ylabel('# Occurences')
-plt.title('Distribution of LPC Coefficients')
-plt.grid(True)
-
-# Excitation signal
-excitation_sig_array = np.concatenate(TransmitData['excitation_sigs'], axis=0)
-
-plt.figure(11, clear=True)
-plt.hist(excitation_sig_array.flatten(), bins=n_levels)
-plt.xlabel('Value')
-plt.ylabel('# Occurences')
-plt.title('Distribution of Excitation Signal Values')
-plt.grid(True)
+    TransmitData['lpccs'].append(lpccs)
+    TransmitData['excitations'].append(excitation)
 
 # %% Quantize LPCs and Residual
-is_quantize = True
-if is_quantize:
-    # LPCs
-    coeff_max = lpc_coeff_array.max()
-    coeff_min = lpc_coeff_array.min()
-    n_coeff_bits = 14  # number of bits per LPC
-    
-    # Excitation
-    exc_max = excitation_sig_array.max()
-    exc_min = excitation_sig_array.min()
-    n_exc_bits = 12  # number of bits per LPC
-    
-    for ii in range(n_files):
-        print('\rQuantizing Signal ' + str(ii + 1) + '/' + str(n_files), end='')
-        ap.uniform_quantize(TransmitData['lpc_coeffs'][ii], coeff_max,
-                            coeff_min, n_coeff_bits)
-        ap.uniform_quantize(TransmitData['excitation_sigs'][ii], exc_max,
-                            exc_min, n_exc_bits)
-    # Use Huffman encoding
-# Free memory
-del excitation_sig_array
-del lpc_coeff_array
+# Original data
+orig_signals_array = np.concatenate(OrigData['signals'], axis=0)
 
-# %% Data Rate
-# Original Data
-orig_data_rate = 16 * samp_rate  # 16 bit/samp * samp_rate samps/sec
+# LPC data
+lpccs_array = np.concatenate(TransmitData['lpccs'], axis=0).flatten()
+excitations_array = np.concatenate(TransmitData['excitations'], axis=0).flatten()
 
-# LPC Base case
-n_lpc_bits = lpc_order * n_coeff_bits  # bits per frame
-n_excitation_bits = n_exc_bits * TransmitData['excitation_sigs'][ii].shape[1]
-lpc_base_data_rate = (n_lpc_bits + n_excitation_bits) / frame_time
+# LPCs
+coeff_max = lpccs_array.max()
+coeff_min = lpccs_array.min()
+coeff_levels = ap.get_uniform_quantize_levels(vmax=coeff_max,
+                                              vmin=coeff_min,
+                                              n_bits=n_quantize_bits_lpcc)
+
+# Excitation
+exc_max = excitations_array.max()
+exc_min = excitations_array.min()
+exc_levels = ap.get_uniform_quantize_levels(vmax=exc_max,
+                                            vmin=exc_min,
+                                            n_bits=n_quantize_bits_exc)
+
+for ii, (coeffs, excitation) in enumerate(zip(TransmitData['lpccs'],
+                                              TransmitData['excitations'])):
+    print('\rQuantizing Signal ' + str(ii + 1) + '/' + str(n_files), end='')
+    ap.uniform_quantize(array=coeffs, levels=coeff_levels)
+    ap.uniform_quantize(array=excitation, levels=exc_levels)
+
+# %% Compute Entropy; Determine Optimal Compression Rate
+print('\n*** ENTROPIES ***')
+# Original signal
+unique_vals, rel_freqs = stats.get_rel_freqs(orig_signals_array)
+n_zero = 2**n_quantize_bits_orig - rel_freqs.shape[0]  # values with 0 frequency
+orig_entropy = scistats.entropy(pk=np.concatenate((rel_freqs, np.zeros((n_zero,))), axis=0))
+print('Entropy of Original Speech Signal: %.3f bits/sample' % orig_entropy)
+
+plt.figure(12, clear=True)
+plt.plot(unique_vals, rel_freqs)
+plt.xlabel('Value')
+plt.ylabel('Relative Frequency')
+plt.title('Relative Frequencies of Original Signal Values')
+plt.grid(True)
+
+# Excitations
+excitations_array = np.concatenate(TransmitData['excitations'], axis=0)
+unique_vals, rel_freqs = stats.get_rel_freqs(excitations_array)
+n_zero = 2**n_quantize_bits_exc - rel_freqs.shape[0]  # values with 0 frequency
+exc_entropy = scistats.entropy(pk=np.concatenate((rel_freqs, np.zeros((n_zero,))), axis=0))
+print('Entropy of Excitation Signal: %.3f bits/sample' % exc_entropy)
+
+plt.figure(13, clear=True)
+plt.plot(unique_vals, rel_freqs)
+plt.xlabel('Value')
+plt.ylabel('Relative Frequency')
+plt.title('Relative Frequencies of Quantized Excitation Signal Values')
+plt.grid(True)
+
+# LPCCs
+lpccs_array = np.concatenate(TransmitData['lpccs'], axis=0).flatten()
+unique_vals, rel_freqs = stats.get_rel_freqs(lpccs_array)
+n_zero = 2**n_quantize_bits_lpcc - rel_freqs.shape[0]  # values with 0 frequency
+lpcc_entropy = scistats.entropy(pk=np.concatenate((rel_freqs, np.zeros((n_zero,))), axis=0))
+print('Entropy of LPCCs: %.3f bits/coeff' % lpcc_entropy)
+
+plt.figure(14, clear=True)
+plt.plot(unique_vals, rel_freqs)
+plt.xlabel('Value')
+plt.ylabel('Relative Frequency')
+plt.title('Relative Frequencies of LPCC Values')
+plt.grid(True)
 
 # %% Decoder
-reconstruct_sigs = []
+ReconstructData = {'signals': []}
 
 for ii, filename in enumerate(files):
-    # INPUTS
-    exc_sig_per_frame = TransmitData['excitation_sigs'][ii]
-    lpc_coeffs = TransmitData['lpc_coeffs'][ii]
-
     # Reconstruction
-    reconstruct_sig = ap.reconstruct_lpc(exc_sig_per_frame=exc_sig_per_frame,
-                                         lpc_coeffs=lpc_coeffs,
+    reconstruct_sig = ap.reconstruct_lpc(exc_sig_per_frame=TransmitData['excitations'][ii],
+                                         lpc_coeffs=TransmitData['lpccs'][ii],
                                          frame_len=frame_len,
                                          overlap_len=overlap_len)
-    reconstruct_sigs.append(reconstruct_sig.flatten())  # still zero-padded; must adjust to compare to original
+    ReconstructData['signals'].append(reconstruct_sig.flatten())  # still zero-padded; must adjust to compare to original
 
 # %% Analyze Reconstruction Error
-is_hear_reconstruct = True  # listen to every Nth speaker reconstructed
+is_hear_reconstruct = False  # listen to every Nth speaker reconstructed
 is_show_reconstruct = False  # show reconstruction plot
 n_listens = 1  # how many random reconstructions to play
 random_listens = np.random.randint(low=0, high=n_files, size=(n_listens,))
 
-n_tot_samps = 0
+n_tot_samps = 0  # can't pre-initialize since signals are variable length
 squared_err = 0
 
-for ii, (reconstruct_sig, orig_sig) in enumerate(zip(reconstruct_sigs, orig_sigs)):
-    print('\rReconstructing Signal ' + str(ii + 1) + '/' + str(len(orig_sigs)), end='')
-    # Align reconstructed data to the original
-    n_front = np.ceil(overlap_len//2).astype(int) + lpc_order  # number of samples in front of orig signal that are not used in LPC
-    n_long = reconstruct_sig.shape[0]
+for ii, (reconstruct_sig, orig_sig) in enumerate(zip(ReconstructData['signals'],
+                                                     OrigData['signals'])):
+    print('\rReconstructing Signal %d/%d' % (ii + 1, n_files), end='')
+    # 1) Align reconstructed data to the original
+    # number of samples in front of orig signal that are not used in LPC
+    n_front = np.ceil(overlap_len//2).astype(int) + lpc_order
+    n_long = reconstruct_sig.shape[0]  # reconstruction stops short of end of data
     orig_sig = orig_sig[n_front:n_front + n_long]
     
     n_tot_samps += n_long
     squared_err += np.sum((orig_sig - reconstruct_sig)**2)
     
     if is_show_reconstruct:
-        plt.figure(5, clear=True)
-        plt.plot(orig_sig, 'b-*', fillstyle='none', label='Original')
+        plt.figure(6, clear=True)
+        plt.plot(orig_sig, 'b-o', fillstyle='none', label='Original')
         plt.plot(reconstruct_sig, 'r-.', label='Reconstruction')
-        plt.ylim([-5, 5])
+        plt.ylim([-2, 2])
         plt.xlabel('Sample Index')
         plt.ylabel('Amplitude')
-        plt.title('Reconstruction from Residual')
+        plt.title('Reconstruction from Residual, file#: %d/%d' % (ii, n_files))
         plt.grid(True)
         plt.legend()
         plt.pause(0.5)
@@ -164,17 +182,7 @@ for ii, (reconstruct_sig, orig_sig) in enumerate(zip(reconstruct_sigs, orig_sigs
         sd.play(reconstruct_sig[:n_samps], samplerate=samp_rate)
         time.sleep(1.1*time_play)
 
-# Mean squared error per sample
-lpc_base_error = squared_err / n_tot_samps  # Mean squared error per sample
-print('\n# ******************')
-print('# LPC nBits: ' + str(n_coeff_bits))
-print('# Excitation nBits: ' + str(n_exc_bits))
-
-print('# Squared Error: ' + str(squared_err))
-print('# LPC Base Error: ' + str(lpc_base_error))
-
-print('# Original Data Rate: ' + str(orig_data_rate) + ' bps')
-print('# LPC Base Data Rate: ' + str(lpc_base_data_rate) + ' bps')
+print('Reconstruction Mean Squared Error: %.3e' % (squared_err/n_tot_samps))
 
 # %% RESULTS
 # It appears reconstruction error > 1e-4 sounds bad
