@@ -117,8 +117,7 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
     n_samps = data.shape[0]
     n_frames = (n_samps - (lpc_order + overlap_len)) // frame_len
     coeffs = np.zeros((n_frames, lpc_order))
-    excitation_signal = np.zeros((data.shape))
-    
+
     exc_sig_per_frame = np.zeros((n_frames, frame_len + lpc_order))
     gain = np.zeros((n_frames,))
   
@@ -304,35 +303,67 @@ def get_uniform_quantize_levels(vmax, vmin, n_bits):
     return levels
     
     
-def uniform_quantize(array, levels):
-    """
-    # FIX-KT: Totally broken!
-    Quantize array of data uniformly using the parameters given in input
+# def uniform_quantize(array, levels):
+#     """
+#     # FIX-KT: Totally broken!
+#     Quantize array of data uniformly using the parameters given in input
 
+#     Parameters
+#     ----------
+#     array : decimal, [...]
+#         Array of data directly changed
+
+#     levels : decimal, [2*n_bits,]
+#         Values of quantization levels
+
+#     Returns
+#     -------
+#     quantized : decimal, [...]
+#         Quantized array
+#     """
+#     # Takes too long
+#     # orig_shape = array.shape
+#     # dist = array.reshape(np.prod(orig_shape), 1) - levels[np.newaxis, :]
+#     # min_idx = np.argmin(np.abs(dist), axis=1)  # round to closest level
+#     # quantized = levels[min_idx].reshape(orig_shape)
+    
+#     # Faster way
+#     top_level = np.inf
+#     for bottom_level in levels:
+#         array[np.logical_and(array >= bottom_level, array < top_level)] = bottom_level
+#         top_level = bottom_level
+
+def quantize(array, vmin, vmax, n_bits):
+    """
+    Quantize signal with uniform quantization
+    
     Parameters
     ----------
-    array : decimal, [...]
-        Array of data directly changed
+    array : decimal, [N, M, ...]
+        Input data array
 
-    levels : decimal, [2*n_bits,]
-        Values of quantization levels
+    vmin : decimal, scalar
+        Minumum quantization reference
+
+    vmax : decimal, scalar
+        Maxumum quantization reference
+
+    n_bits : int, scalar
+        Number of bits used for quantization
 
     Returns
     -------
-    quantized : decimal, [...]
-        Quantized array
+    quant_idx : int, [N, M, ...]
+        Index of the quantization level, from [0, n_levels-1]
+
+    quant_levels : decimal, [2**n_bits,]
+        Quantization level values
     """
-    # Takes too long
-    # orig_shape = array.shape
-    # dist = array.reshape(np.prod(orig_shape), 1) - levels[np.newaxis, :]
-    # min_idx = np.argmin(np.abs(dist), axis=1)  # round to closest level
-    # quantized = levels[min_idx].reshape(orig_shape)
-    
-    # Faster way
-    top_level = np.inf
-    for bottom_level in levels:
-        array[np.logical_and(array >= bottom_level, array < top_level)] = bottom_level
-        top_level = bottom_level
+    step = (vmax - vmin) / 2**n_bits
+    quant_idx = np.floor((array - vmin) / step)
+    quant_idx = np.maximum(np.minimum(quant_idx, 2**n_bits-1), 0).astype(int)
+    quant_levels = np.arange(start=vmin, stop=vmax, step=step)
+    return quant_idx, quant_levels
 
 def vector_quantize(vectors, codebook):
     """
@@ -354,3 +385,29 @@ def vector_quantize(vectors, codebook):
     dist_matrix = np.linalg.norm(vectors[:, np.newaxis, :] - codebook[np.newaxis, :, :], axis=2)
     arg_min = np.argmin(dist_matrix, axis=1)
     return arg_min
+
+def is_voiced(signal):
+    """
+    Detect whether signal is voiced
+
+    Parameters
+    ----------
+    signal : decimal, [N,]
+        Audio signal
+
+    Returns
+    -------
+    is_voiced : bool, scalar
+        True if input signal is voiced, false if unvoiced
+    """
+    corr_half_idx = signal.shape[0] // 2
+    corr = sig.correlate(in1=signal,
+                         in2=signal,
+                         mode='same')[corr_half_idx:]
+    plt.figure(1, clear=True)
+    plt.plot(corr)
+    plt.xlabel('Samples')
+    plt.ylabel('Correlation Value')
+    plt.title('Autocorrelation')
+    
+    
