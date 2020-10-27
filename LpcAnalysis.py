@@ -18,7 +18,7 @@ import audio_processing as ap
 import stats as stats
 
 # %% Read File
-path = 'C:\\Users\\ktopo\\Desktop\\School\\Courses\\Masters\\ECE 576 - Information Engineering\\Project\\sample_voice_data-master\\sample_voice_data-master\\females'
+path = 'C:\\Users\\Kenny\\Desktop\\School\\Courses\Masters\\ECE 576 - Information Engineering\\Project\\sample_voice_data-master\\sample_voice_data-master\\females'
 files = os.listdir(path)
 random.shuffle(files)
 
@@ -27,26 +27,30 @@ files = files[:n_files]
 n_quantize_bits_orig = 16
 
 # Configure LPC
-method = 'vq'  # 'vq' - vector quantization; `base` - base LPC using quantization on excitation signal
+method = 'base'  # 'vq' - vector quantization; `base` - base LPC using quantization on excitation signal
 
 if method == 'base':
     LpcConfig = {'order': 10,
                  'overlap_time': 10e-3,
                  'frame_time': 20e-3,
                  'n_bits_lpcc': 14,
-                 'n_bits_excite': 12}
+                 'n_bits_excite': 12,
+                 'n_bits_gain': 12}
 elif method == 'vq':
     LpcConfig = {'order': 10,
                  'overlap_time': 10e-3,
                  'frame_time': 20e-3,
                  'n_bits_lpcc': 14,
-                 'n_bits_vq': 10}
+                 'n_bits_vq': 6,
+                 'n_bits_gain': 12}
 
 # %% Encoder
 # Data transmitted to decoder
 OrigData = {'signals': []}
 TransmitData = {'lpccs': [],
-                'excitations': []}
+                'excitations': [],
+                'gains': [],
+                'pitch_periods': []}
 
 print('***************')
 for ii, filename in enumerate(files):
@@ -75,13 +79,16 @@ for ii, filename in enumerate(files):
     overlap_len = int(LpcConfig['overlap_time'] / samp_period)
 
     # Compute LPCs and excitation using baseline method
-    lpccs, excitation, _ = ap.lpc(data=data, lpc_order=LpcConfig['order'],
-                                  frame_len=frame_len,
-                                  overlap_len=overlap_len)
+    lpccs, excitation, gain, pitch_period = ap.lpc(data=data,
+                                                   lpc_order=LpcConfig['order'],
+                                                   frame_len=frame_len,
+                                                   overlap_len=overlap_len)
 
     # OUTPUTS
     TransmitData['lpccs'].append(lpccs)
     TransmitData['excitations'].append(excitation)
+    TransmitData['gains'].append(gain)
+    TransmitData['pitch_periods'].append(pitch_period)
 
 is_save = True
 if is_save:
@@ -106,6 +113,15 @@ for ii, lpcc in enumerate(TransmitData['lpccs']):
     quant_idx, quant_levels = ap.quantize(array=lpcc, vmin=vmin, vmax=vmax, n_bits=LpcConfig['n_bits_lpcc'])
     TransmitData['lpccs'][ii] = quant_levels[quant_idx]
 
+# %% Quantize Gain
+gain_array = np.concatenate(TransmitData['gains'], axis=0).flatten()
+vmin, vmax = gain_array.min(), gain_array.max()
+
+for ii, gain in enumerate(TransmitData['gains']):
+    print('\rQuantizing Gain - file %d/%d' % (ii + 1, n_files), end='')
+    quant_idx, quant_levels = ap.quantize(array=gain, vmin=vmin, vmax=vmax, n_bits=LpcConfig['n_bits_gain'])
+    TransmitData['gains'][ii] = quant_levels[quant_idx]
+
 # %% Quantize Residual/Excitation
 if method == 'base':
     excitations_array = np.concatenate(TransmitData['excitations'], axis=0).flatten()
@@ -121,18 +137,20 @@ elif method == 'vq':
     n_vectors = 2**LpcConfig['n_bits_vq']  # num vectors in codebook; power of 2
     codebook_vec_count = np.zeros((n_vectors,))
 
-    # print('\nClustering to find codebook vectors...')
-    # kmeans = KMeans(n_clusters=n_vectors).fit(excitations_array)
-    # codebook = kmeans.cluster_centers_  # [n_vectors, lpc_order + frame_len]
-    # print('Done clustering')
-
-    # excite_fft = np.abs(np.fft.fft(excitations_array, axis=1))
-    # kmeans = KMeans(n_clusters=n_vectors).fit(excite_fft)
-    # codebook = np.real(np.fft.ifft(kmeans.cluster_centers_, axis=1))  # [n_vectors, lpc_order + frame_len]
+    is_cluster = True
+    if is_cluster:
+        print('\nClustering to find codebook vectors...')
+        kmeans = KMeans(n_clusters=n_vectors).fit(excitations_array)
+        codebook = kmeans.cluster_centers_  # [n_vectors, lpc_order + frame_len]
+        print('Done clustering')
     
-    # Select random excitation  frames from dataset for codebook
-    rand_idx = np.random.randint(low=0, high=excitations_array.shape[0], size=(n_vectors,))
-    codebook = excitations_array[rand_idx, :]
+        excite_fft = np.abs(np.fft.fft(excitations_array, axis=1))
+        kmeans = KMeans(n_clusters=n_vectors).fit(excite_fft)
+        codebook = np.real(np.fft.ifft(kmeans.cluster_centers_, axis=1))  # [n_vectors, lpc_order + frame_len]
+    else:
+        # Select random excitation  frames from dataset for codebook
+        rand_idx = np.random.randint(low=0, high=excitations_array.shape[0], size=(n_vectors,))
+        codebook = excitations_array[rand_idx, :]
     
     # is_debug = False
     # if is_debug:
@@ -234,7 +252,7 @@ elif method == 'vq':
     plt.title('Sorted Relative Frequencies of Codebook Vectors')
     plt.grid(True)
 
-# %% LPCCs
+# %% Entropy of LPCCs
 unique_vals, rel_freqs = stats.get_rel_freqs(np.concatenate(TransmitData['lpccs'], axis=0))
 n_zero = 2**LpcConfig['n_bits_lpcc'] - rel_freqs.shape[0]  # values with 0 frequency
 lpcc_entropy = scistats.entropy(pk=np.concatenate((rel_freqs, np.zeros((n_zero,))), axis=0))
@@ -248,36 +266,46 @@ plt.ylabel('Relative Frequency')
 plt.title('Relative Frequencies of LPCC Values')
 plt.grid(True)
 
+# %% Entropy of Gains
+gain_array = np.concatenate(TransmitData['gains'], axis=0).flatten()
+unique_vals, rel_freqs = stats.get_rel_freqs(gain_array)
+n_zero = 2**LpcConfig['n_bits_gain'] - rel_freqs.shape[0]  # values with 0 frequency
+gain_entropy = scistats.entropy(pk=np.concatenate((rel_freqs, np.zeros((n_zero,))), axis=0))
+print('\n=== Gain ===')
+print('Original Gain # Bits: %d\tEntropy: %.3f bits/sample' % (LpcConfig['n_bits_gain'], gain_entropy))
+
+plt.figure(15, clear=True)
+plt.plot(unique_vals, rel_freqs)
+plt.xlabel('Value')
+plt.ylabel('Relative Frequency')
+plt.title('Relative Frequencies of Gain Values')
+plt.grid(True)
+
 # %% Decoder
-# def gen_deltas(n_samps, period):
-#     """
-#     Generate Dirac Delta pulse train with given period
-    
-#     Parameters
-#     ----------
-#     n_samps : int, scalar
-#         Number of samples long
-
-#     period : int, scalar
-#         Period of the impulses, in samples
-
-#     Returns
-#     -------
-#     pulse_train : decimal, [n_samps,]
-#         Pulse train
-#     """
-#     sig = np.zeros((n_samps,))
-#     sig[np.arange(start=0, stop=n_samps, step=period, dtype=int)] = 1
-#     return sig
-
 ReconstructData = {'signals': []}
 
 for ii, filename in enumerate(files):
-    # Reconstruction
-    reconstruct_sig = ap.reconstruct_lpc(exc_sig_per_frame=TransmitData['excitations'][ii],
-                                          lpc_coeffs=TransmitData['lpccs'][ii],
-                                          frame_len=frame_len,
-                                          overlap_len=overlap_len)
+    lpccs = TransmitData['lpccs'][ii]
+    gains = TransmitData['gains'][ii]
+
+    is_gen_excitation = True
+    if is_gen_excitation:
+        # Reconstruction
+        n_frame = lpccs.shape[0]
+        n_samps_per_frame = frame_len + LpcConfig['order']
+        pitch_periods = TransmitData['pitch_periods'][ii]
+        excitations = np.zeros((n_frame, n_samps_per_frame))
+        scale = 2
+        for ii, period in enumerate(pitch_periods):
+            excitations[ii, :] = scale * ap.gen_deltas(n_samps=n_samps_per_frame, period=period*4)
+    else:
+        excitations = TransmitData['excitations'][ii]
+    
+    reconstruct_sig = ap.reconstruct_lpc(exc_sig_per_frame=excitations,
+                                         lpc_coeffs=lpccs,
+                                         gain=gains,
+                                         frame_len=frame_len,
+                                         overlap_len=overlap_len)
     # n_frames, n_samps_per_frame = TransmitData['excitations'][ii].shape
     # delta_sig = 0.2 * gen_deltas(n_samps=n_samps_per_frame, period=40)
     # delta_sig = np.repeat(delta_sig[np.newaxis, :], axis=0, repeats=n_frames)

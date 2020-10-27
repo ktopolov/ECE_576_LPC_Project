@@ -113,6 +113,9 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
 
     gain : decimal, [n_frames,]
         Gain of the filter
+
+    pitch_period : decimal, [n_frames,]
+        Pitch period, in samples
     """
     n_samps = data.shape[0]
     n_frames = (n_samps - (lpc_order + overlap_len)) // frame_len
@@ -120,6 +123,7 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
 
     exc_sig_per_frame = np.zeros((n_frames, frame_len + lpc_order))
     gain = np.zeros((n_frames,))
+    pitch_period = np.zeros((n_frames,))
   
     # Indices: overap frames to fit LPCs but only use computation for non-overlapping portion
     n_samps_fit = int(frame_len + overlap_len + lpc_order)
@@ -144,6 +148,14 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
         c = corr[:lpc_order]  # col and row of autocorr toeplitz matrix
         b = corr[1:lpc_order+1]
 
+        # Compute zero-crossings; TODO-USE!
+        sgn = np.ones(fit_data.shape)
+        sgn[fit_data < 0] = -1
+        diff_sgn = np.diff(sgn)
+        n_zero_crossings = (diff_sgn != 0).sum()
+        zero_crossing_rate = n_zero_crossings / diff_sgn.size
+        pitch_period[ifr] = (np.argmin(corr[1:]) + 1)  # in samples
+        
         # Use pseudo-inverse since solve_toeplitz becomes singular
         # Using Levinson-Durbin solving got singular matrix error
         auto_corr = scilin.toeplitz(c)
@@ -161,15 +173,19 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
         s_hat = sig.lfilter(b=num, a=den, x=s)
 
         exc_sig = s - s_hat
-        exc_sig_per_frame[ifr, :] = exc_sig
-
+        
         # %% Get gain and pitch? TODO
         n_exc_samps = exc_sig.shape[0]
         corr_half_idx = n_exc_samps // 2
         exc_corr = sig.correlate(in1=exc_sig, in2=exc_sig, mode='same')[corr_half_idx:]  # from t=0 onward by 1 sample step
         t_axis = np.arange(n_exc_samps // 2)
         
-        gain = np.linalg.norm(exc_corr, axis=0)
+        frame_gain = np.sqrt(np.mean(exc_sig**2))
+        exc_sig /= frame_gain
+        
+        exc_sig_per_frame[ifr, :] = exc_sig
+        gain[ifr] = frame_gain
+        
 
         # %% Debug
         is_debug = False
@@ -228,10 +244,10 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
             plt.show()
             plt.pause(1.0)
 
-    return coeffs, exc_sig_per_frame, gain
+    return coeffs, exc_sig_per_frame, gain, pitch_period
 
 
-def reconstruct_lpc(exc_sig_per_frame, lpc_coeffs, frame_len, overlap_len):
+def reconstruct_lpc(exc_sig_per_frame, lpc_coeffs, gain, frame_len, overlap_len):
     """
     Given LPC coefficients and excitation signal, reconstruct speech
     
@@ -242,6 +258,9 @@ def reconstruct_lpc(exc_sig_per_frame, lpc_coeffs, frame_len, overlap_len):
 
     coeffs : decimal, [n_frames, lpc_order + 1]
         LPC coefficients
+
+    gain : decimal, [n_frames,]
+        Gain of the LPC filter
 
     frame_len : int, scalar
         Frame length, in samples (non-overlapping piece)
@@ -258,80 +277,26 @@ def reconstruct_lpc(exc_sig_per_frame, lpc_coeffs, frame_len, overlap_len):
     n_frames, lpc_order = lpc_coeffs.shape
     n_samp_per_frame = exc_sig_per_frame.shape[1] - lpc_order
     reconstruct_sig = np.zeros((n_frames, n_samp_per_frame))
-    #step = frame_len
-    #excess_start = int((lpc_order + 1) + overlap_len//2)
 
     for ifr in range(n_frames):
-        # Indices of data
-        #val_st = ifr * step + excess_start
-        #val_end = val_st + frame_len
-        
         # Filter excitation signal with vocal tract filter
         coeffs = lpc_coeffs[ifr, :]
         vocal_filt_den = np.concatenate((np.array([1]), -coeffs), axis=0)
         vocal_filt_num = np.array([1])
+        
+        # FIX: Choose only one of these
+        is_use_prev_frame = False  # doesn't work great; static noise
+        if is_use_prev_frame and ifr > 0:
+            excitation = gain[ifr] * np.concatenate((exc_sig_per_frame[ifr-1, -lpc_order:],
+                                                     exc_sig_per_frame[ifr, lpc_order:]), axis=0)
+        else:
+            excitation = gain[ifr] * exc_sig_per_frame[ifr, :]
 
         # TODO-KT: do i need to take lpc_order extra samples of exc_sig?
-        reconstruct = sig.lfilter(b=vocal_filt_num, a=vocal_filt_den, x=exc_sig_per_frame[ifr, :])
+        reconstruct = sig.lfilter(b=vocal_filt_num, a=vocal_filt_den, x=excitation)
         reconstruct_sig[ifr, :] = reconstruct[lpc_order:]
     return reconstruct_sig
 
-
-def get_uniform_quantize_levels(vmax, vmin, n_bits):
-    """
-    Returns the values of each quantization level for uniform quantization
-    
-    Parameters
-    ----------
-    vmax : decimal, scalar
-        Maximum quantization value
-
-    vmin : decimal, scalar
-        Minimum quantization value
-
-    n_bits : int, scalar
-        Number of bits to use for quantization
-
-    Returns
-    -------
-    levels : decimal, [2*n_bits,]
-        Values of quantization levels
-    """
-    n_levels = 2**n_bits
-    step = (vmax - vmin) / n_levels
-    levels = np.flip(np.arange(start=vmin, stop=vmax, step=step), axis=0)  # descending
-    return levels
-    
-    
-# def uniform_quantize(array, levels):
-#     """
-#     # FIX-KT: Totally broken!
-#     Quantize array of data uniformly using the parameters given in input
-
-#     Parameters
-#     ----------
-#     array : decimal, [...]
-#         Array of data directly changed
-
-#     levels : decimal, [2*n_bits,]
-#         Values of quantization levels
-
-#     Returns
-#     -------
-#     quantized : decimal, [...]
-#         Quantized array
-#     """
-#     # Takes too long
-#     # orig_shape = array.shape
-#     # dist = array.reshape(np.prod(orig_shape), 1) - levels[np.newaxis, :]
-#     # min_idx = np.argmin(np.abs(dist), axis=1)  # round to closest level
-#     # quantized = levels[min_idx].reshape(orig_shape)
-    
-#     # Faster way
-#     top_level = np.inf
-#     for bottom_level in levels:
-#         array[np.logical_and(array >= bottom_level, array < top_level)] = bottom_level
-#         top_level = bottom_level
 
 def quantize(array, vmin, vmax, n_bits):
     """
@@ -410,4 +375,78 @@ def is_voiced(signal):
     plt.ylabel('Correlation Value')
     plt.title('Autocorrelation')
     
+# %%
+# i_sig= 4
+# signal = OrigData['signals'][i_sig]
+# tot_frame_len = LpcConfig['order'] + frame_len + overlap_len
+# ends = np.arange(start=frame_len, stop=signal.size, step=frame_len)
+# starts = ends - frame_len
+# power = np.zeros(starts.shape)
+# is_voiced = np.zeros(starts.shape, dtype=bool)
+# zero_crossing_rate = np.zeros(starts.shape)
+
+# voiced_threshold = 0.01
+
+# for ii, st_idx in enumerate(starts):
+#     clip = signal[st_idx:st_idx + tot_frame_len]
+#     power[ii] = np.dot(clip, clip) / tot_frame_len
+#     is_voiced[ii] = power[ii] > voiced_threshold
     
+#     half_idx = clip.size//2
+#     corr = sig.correlate(in1=clip, in2=clip, mode='same')[half_idx:]
+    
+#     sgn = np.ones(clip.shape)
+#     sgn[clip < 0] = -1
+#     diff_sgn = np.diff(sgn)
+#     n_zero_crossings = (diff_sgn != 0).sum()
+#     zero_crossing_rate[ii] = n_zero_crossings / diff_sgn.size
+
+
+# # TODO-Zero-crossing rate
+# plt.figure(3, clear=True)
+# plt.plot(signal, 'k-', label='Speech Signal')
+# plt.step(starts, power, 'r-', label='Energy')
+# plt.step(starts, is_voiced, 'b-', label='Is Voiced')
+# plt.step(starts, zero_crossing_rate, 'c-', label='Zero-Crossing Rate')
+# plt.title('Speech Signal')
+# plt.xlabel('Sample Index')
+# plt.ylabel('Value')
+# plt.grid(True)
+# plt.legend()
+# plt.show()
+
+# # Correlation
+# plt.figure(5, clear=True)
+# plt.plot(corr)
+# pitch_period = (np.argmin(corr[1:]) + 1)  # in samples
+# plt.xlabel('Lag')
+# plt.ylabel('Value')
+# plt.title('Autoorrelation')
+
+def gen_deltas(n_samps, period):
+    """
+    Generate Dirac Delta pulse train with given period
+
+    Parameters
+    ----------
+    n_samps : int, scalar
+        Number of samples long
+
+    period : int, scalar
+        Period of the impulses, in samples
+
+    Returns
+    -------
+    pulse_train : decimal, [n_samps,]
+        Pulse train
+    """
+    sig = np.zeros((n_samps,))
+    sig[np.arange(start=period//2, stop=n_samps, step=period, dtype=int)] = 1
+    return sig
+
+# sig = gen_deltas(n_samps=clip.size, period=pitch_period)
+# plt.figure(6, clear=True)
+# plt.plot(sig)
+# plt.title('Impulse Signal')
+# plt.grid(True)
+
