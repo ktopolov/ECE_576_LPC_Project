@@ -117,14 +117,7 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
     pitch_period : decimal, [n_frames,]
         Pitch period, in samples
     """
-    n_samps = data.shape[0]
-    n_frames = (n_samps - (lpc_order + overlap_len)) // frame_len
-    coeffs = np.zeros((n_frames, lpc_order))
-
-    exc_sig_per_frame = np.zeros((n_frames, frame_len + lpc_order))
-    gain = np.zeros((n_frames,))
-    pitch_period = np.zeros((n_frames,))
-  
+    n_samps = data.shape[0]  
     # Indices: overap frames to fit LPCs but only use computation for non-overlapping portion
     n_samps_fit = int(frame_len + overlap_len + lpc_order)
 
@@ -133,6 +126,13 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
     fit_st_vec = fit_end_vec - n_samps_fit  # first one should be 0 if done right
     frame_st_vec = fit_st_vec + np.ceil(overlap_len//2).astype(int) + lpc_order
     frame_end_vec = frame_st_vec + frame_len
+    
+    n_frames = fit_end_vec.shape[0]
+    coeffs = np.zeros((n_frames, lpc_order))
+
+    exc_sig_per_frame = np.zeros((n_frames, frame_len + lpc_order))
+    gain = np.zeros((n_frames,))
+    pitch_period = np.zeros((n_frames,))
 
     for ifr in range(n_frames):
         # Get data indices for fitting
