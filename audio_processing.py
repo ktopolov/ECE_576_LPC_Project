@@ -78,7 +78,7 @@ def read_wave(filename):
     return data, samp_rate
 
 # %% LPC
-def lpc(data, frame_len, overlap_len, lpc_order=15):
+def lpc(data, frame_len, overlap_len, lpc_order=15, zero_cross_thresh=0.25):
     """
     Perform Linear Predictive Coding
     
@@ -96,10 +96,9 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
     lpc_order : int, scalar
         Order of the LPC filter to fit; # filter coefficients = lpc_order + 1
 
-    method : str
-        Method to obtain excitation
-            'inv_filter': use inverse of estimated vocal tract filter to obtain exact residual to reconstruct signal
-            'residual': use the estimated vocal tract to predict the signal outcome, then take difference between true and estimated s(n)
+    zero_cross_thresh : decimal, scalar
+        Zero-crossing rate (per-sample) threshold for voiced/unvoiced detection.
+        If above this threshold, speech is unvoiced; otherwise, voiced
 
     Returns
     -------
@@ -118,10 +117,9 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
         Pitch period, in samples
     """
     n_samps = data.shape[0]  
-    # Indices: overap frames to fit LPCs but only use computation for non-overlapping portion
-    n_samps_fit = int(frame_len + overlap_len + lpc_order)
+    n_samps_fit = int(frame_len + overlap_len + lpc_order)  # number total samples used for fitting LPCCs
 
-    # Data lengths is overlap_len + lpc_order + frame_len
+    # Get overlapping (fit) and non-overlapping data
     fit_end_vec = np.arange(start=n_samps_fit, stop=n_samps, step=frame_len, dtype=int)  # end of data for fitting autocorr and LPCs
     fit_st_vec = fit_end_vec - n_samps_fit  # first one should be 0 if done right
     frame_st_vec = fit_st_vec + np.ceil(overlap_len//2).astype(int) + lpc_order
@@ -133,6 +131,7 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
     exc_sig_per_frame = np.zeros((n_frames, frame_len + lpc_order))
     gain = np.zeros((n_frames,))
     pitch_period = np.zeros((n_frames,))
+    is_voiced = np.zeros((n_frames,), dtype=bool)
 
     for ifr in range(n_frames):
         # Get data indices for fitting
@@ -149,12 +148,12 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
         b = corr[1:lpc_order+1]
 
         # Compute zero-crossings; TODO-USE!
-        sgn = np.ones(fit_data.shape)
-        sgn[fit_data < 0] = -1
-        diff_sgn = np.diff(sgn)
-        n_zero_crossings = (diff_sgn != 0).sum()
-        zero_crossing_rate = n_zero_crossings / diff_sgn.size
-        pitch_period[ifr] = (np.argmin(corr[1:]) + 1)  # in samples
+        zero_cross_rate = get_zero_cross_rate(fit_data)
+        is_voiced[ifr] = zero_cross_rate < zero_cross_thresh
+        
+        min_period = 4  # 4kHz ish
+        # max_period = 
+        pitch_period[ifr] = (np.argmax(corr[min_period:]) + min_period)  # in samples
         
         # Use pseudo-inverse since solve_toeplitz becomes singular
         # Using Levinson-Durbin solving got singular matrix error
@@ -180,7 +179,7 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
         exc_corr = sig.correlate(in1=exc_sig, in2=exc_sig, mode='same')[corr_half_idx:]  # from t=0 onward by 1 sample step
         t_axis = np.arange(n_exc_samps // 2)
         
-        frame_gain = np.sqrt(np.mean(exc_sig**2))
+        frame_gain = np.sqrt(get_energy(exc_sig))
         exc_sig /= frame_gain
         
         exc_sig_per_frame[ifr, :] = exc_sig
@@ -244,7 +243,7 @@ def lpc(data, frame_len, overlap_len, lpc_order=15):
             plt.show()
             plt.pause(1.0)
 
-    return coeffs, exc_sig_per_frame, gain, pitch_period
+    return coeffs, exc_sig_per_frame, gain, pitch_period, is_voiced
 
 
 def reconstruct_lpc(exc_sig_per_frame, lpc_coeffs, gain, frame_len, overlap_len):
@@ -375,53 +374,43 @@ def is_voiced(signal):
     plt.ylabel('Correlation Value')
     plt.title('Autocorrelation')
     
-# %%
-# i_sig= 4
-# signal = OrigData['signals'][i_sig]
-# tot_frame_len = LpcConfig['order'] + frame_len + overlap_len
-# ends = np.arange(start=frame_len, stop=signal.size, step=frame_len)
-# starts = ends - frame_len
-# power = np.zeros(starts.shape)
-# is_voiced = np.zeros(starts.shape, dtype=bool)
-# zero_crossing_rate = np.zeros(starts.shape)
+def get_zero_cross_rate(signal):
+    """
+    Compute zero crossings rate (zero crossings per sample)
 
-# voiced_threshold = 0.01
+    Parameters
+    ----------
+    signal : decimal, [N,]
+        Audio signal
 
-# for ii, st_idx in enumerate(starts):
-#     clip = signal[st_idx:st_idx + tot_frame_len]
-#     power[ii] = np.dot(clip, clip) / tot_frame_len
-#     is_voiced[ii] = power[ii] > voiced_threshold
-    
-#     half_idx = clip.size//2
-#     corr = sig.correlate(in1=clip, in2=clip, mode='same')[half_idx:]
-    
-#     sgn = np.ones(clip.shape)
-#     sgn[clip < 0] = -1
-#     diff_sgn = np.diff(sgn)
-#     n_zero_crossings = (diff_sgn != 0).sum()
-#     zero_crossing_rate[ii] = n_zero_crossings / diff_sgn.size
+    Returns
+    -------
+    zero_cross_rate : decimal, scalar
+        Zero crossings rate (crossings per sample)
+    """
+    sgn = np.ones(signal.shape)
+    sgn[signal < 0] = -1
+    diff_sgn = np.diff(sgn)
+    n_zero_crossings = (diff_sgn != 0).sum()
+    zero_cross_rate = n_zero_crossings / diff_sgn.size
+    return zero_cross_rate
 
+def get_energy(signal):
+    """
+    Compute energy
 
-# # TODO-Zero-crossing rate
-# plt.figure(3, clear=True)
-# plt.plot(signal, 'k-', label='Speech Signal')
-# plt.step(starts, power, 'r-', label='Energy')
-# plt.step(starts, is_voiced, 'b-', label='Is Voiced')
-# plt.step(starts, zero_crossing_rate, 'c-', label='Zero-Crossing Rate')
-# plt.title('Speech Signal')
-# plt.xlabel('Sample Index')
-# plt.ylabel('Value')
-# plt.grid(True)
-# plt.legend()
-# plt.show()
+    Parameters
+    ----------
+    signal : decimal, [N,]
+        Audio signal
 
-# # Correlation
-# plt.figure(5, clear=True)
-# plt.plot(corr)
-# pitch_period = (np.argmin(corr[1:]) + 1)  # in samples
-# plt.xlabel('Lag')
-# plt.ylabel('Value')
-# plt.title('Autoorrelation')
+    Returns
+    -------
+    energy : decimal, scalar
+        Energy of signal in Joules
+    """
+    energy = np.dot(signal, signal)
+    return energy
 
 def gen_deltas(n_samps, period):
     """

@@ -38,21 +38,23 @@ LpcConfig = {'order': 10,
              'overlap_time': 10e-3,
              'frame_time': 20e-3}
 
-TransmitData = {'lpccs': [],
-                'excitations': [],
-                'gains': [],
-                'pitch_periods': [],
-                'vq_index': []}
-
-QuantizeConfig = {'n_bit_lpccs': 14,
-                  'n_bit_excitations': 12,
-                  'n_bit_gains': 12,
-                  'n_bit_pitch_periods': 6,
-                  'n_bit_vq_index': 8}
+TransmitData = {}
+if method == 'base':
+    TransmitData = {'lpccs': [], 'excitations': [], 'gains': []}
+    QuantizeConfig = {'n_bit_lpccs': 14, 'n_bit_excitations': 12, 'n_bit_gains': 12}
+elif method == 'vq':
+    TransmitData = {'lpccs': [], 'vq_index': [], 'gains': []}
+    QuantizeConfig = {'n_bit_lpccs': 14, 'n_bit_vq_index': 8, 'n_bit_gains': 12}
+elif method == 'parameterize':
+    TransmitData = {'lpccs': [], 'pitch_periods': [], 'is_voiceds': [], 'gains': []}
+    QuantizeConfig = {'n_bit_lpccs': 14, 'n_bit_pitch_periods': 6, 'n_bit_is_voiceds': 1, 'n_bit_gains': 12}
 
 # Original signal
 n_bit_orig = 16
 max_val = 0.8  # normalize audio -0.8 to 0.8
+
+# Voiced/Unvoiced detection
+z_cross_thresh = 0.25  # anything above is unvoiced
 
 # %% Encoder
 # Data transmitted to decoder
@@ -62,6 +64,7 @@ lpccs = []
 excitations = []
 gains = []
 pitch_periods = []
+is_voiceds = []
 
 print('***************')
 for ii, fullfile in enumerate(fullfiles):
@@ -82,6 +85,33 @@ for ii, fullfile in enumerate(fullfiles):
                                           n_bits=n_bit_orig)
     data = quant_levels[quant_idx]
     OrigData['signals'].append(data)
+    
+    # Zero-crossings plot; Don't remove! Super helpful
+    is_show = False
+    if is_show:
+        z_cross_rate = np.zeros(data.shape)
+        energy = np.zeros(data.shape)
+        window_size = 100  # samples
+        end_idx = np.arange(start=window_size, stop=data.size, step=1)
+        st_idx = end_idx - window_size
+        mid_idx = ((end_idx + st_idx) // 2).astype(int)
+
+        for st, mid, end in zip(st_idx, mid_idx, end_idx):
+            audio_clip = data[st:end]
+            z_cross_rate[mid] = ap.get_zero_cross_rate(audio_clip)
+            energy[mid] = ap.get_energy(audio_clip)
+        
+        plt.figure(1, clear=True)
+        plt.plot(data, 'k-', label='Speech Signal')
+        plt.plot(z_cross_rate, 'r-', label='Zero-Crossing Rate')
+        plt.plot(energy / window_size, 'c-', label='Energy per Sample')
+        plt.plot(np.array([0, data.size-1]), np.ones((2,)) * z_cross_thresh, 'g-*', label='Zero-Crossings Voiced/Unvoiced Threshold')
+        plt.legend()
+        plt.grid()
+        plt.title('Speech Signal vs. Voiced Detector Parameters')
+        plt.xlabel('Slow-time Index')
+        plt.ylim((-1, 1))
+        plt.pause(1.0)
 
     # Compute frame size
     samp_period = 1/samp_rate
@@ -89,16 +119,18 @@ for ii, fullfile in enumerate(fullfiles):
     overlap_len = int(LpcConfig['overlap_time'] / samp_period)
 
     # Compute LPCs and excitation using baseline method
-    lpcc, excitation, gain, pitch_period = ap.lpc(data=data,
-                                                   lpc_order=LpcConfig['order'],
-                                                   frame_len=frame_len,
-                                                   overlap_len=overlap_len)
+    lpcc, excitation, gain, pitch_period, is_voiced = ap.lpc(data=data,
+                                                             lpc_order=LpcConfig['order'],
+                                                             frame_len=frame_len,
+                                                             overlap_len=overlap_len,
+                                                             zero_cross_thresh=z_cross_thresh)
 
     # OUTPUTS
     lpccs.append(lpcc)
     excitations.append(excitation)
     gains.append(gain)
     pitch_periods.append(pitch_period)
+    is_voiceds.append(is_voiced)
 
 is_save = False
 if is_save:
@@ -107,8 +139,8 @@ if is_save:
 # %% Quantize LPC Parameters
 # 1) Setup Quantization
 # Excitations
-excitations_array = np.concatenate(excitations, axis=0)
 if method == 'vq':
+    excitations_array = np.concatenate(excitations, axis=0)
     vq_index = []
     n_vectors = 2**QuantizeConfig['n_bit_vq_index']  # num vectors in codebook; power of 2
     codebook_vec_count = np.zeros((n_vectors,))
@@ -129,6 +161,7 @@ if method == 'vq':
         codebook = excitations_array[rand_idx, :]
 
 elif method == 'base':
+    excitations_array = np.concatenate(excitations, axis=0)
     excitation_min, excitation_max = excitations_array.min(), excitations_array.max()
 
 elif method == 'parameterize':
@@ -177,6 +210,7 @@ elif method == 'vq':
     TransmitData['vq_index'] = vq_index
 elif method == 'parameterize':
     TransmitData['pitch_periods'] = pitch_periods
+    TransmitData['is_voiceds'] = is_voiceds
 
 # %% Entropies
 print('\n ****** ENTROPY ******')
@@ -231,10 +265,13 @@ for ii in range(n_files):
         n_frame = lpccs.shape[0]
         n_samps_per_frame = frame_len + LpcConfig['order']
         pitch_periods = TransmitData['pitch_periods'][ii]
+        is_voiceds = TransmitData['is_voiceds'][ii]
         excitations = np.zeros((n_frame, n_samps_per_frame))
-        scale = 2
-        for ii, period in enumerate(pitch_periods):
-            excitations[ii, :] = scale * ap.gen_deltas(n_samps=n_samps_per_frame, period=period*4)
+        for ii, (period, is_voiced) in enumerate(zip(pitch_periods, is_voiceds)):
+            if is_voiced:
+                excitations[ii, :] = ap.gen_deltas(n_samps=n_samps_per_frame, period=period)
+            else:
+                excitations[ii, :] = np.random.randn(n_samps_per_frame)
     
     reconstruct_sig = ap.reconstruct_lpc(exc_sig_per_frame=excitations,
                                          lpc_coeffs=lpccs,
@@ -247,7 +284,7 @@ for ii in range(n_files):
 # %% Analyze Reconstruction Error
 is_hear_reconstruct = True  # listen to every Nth speaker reconstructed
 is_show_reconstruct = False  # show reconstruction plot
-n_listens = 5  # how many random reconstructions to play
+n_listens = 3  # how many random reconstructions to play
 random_listens = np.random.randint(low=0, high=n_files, size=(n_listens,))
 
 reconstruct_error = []
@@ -276,7 +313,8 @@ for ii, (reconstruct_sig, orig_sig) in enumerate(zip(ReconstructData['signals'],
     
     # Play True and Predicted
     if is_hear_reconstruct and (ii in random_listens):
-        time_play = 6.0  # seconds
+        recording_length = n_long * samp_period
+        time_play = 1.1 * np.minimum(recording_length, 5.0)
         n_samps = int(time_play / samp_period)
         sd.play(orig_sig[:n_samps], samplerate=samp_rate)
         time.sleep(1.1*time_play)
