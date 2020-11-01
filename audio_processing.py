@@ -5,7 +5,7 @@ Functions to assist with speech and other audio processing
 # External
 import numpy as np
 import wave
-import scipy.signal as sig
+import scipy.signal as scisig
 import scipy.linalg as scilin
 import matplotlib.pyplot as plt
 
@@ -141,9 +141,9 @@ def lpc(data, frame_len, overlap_len, lpc_order=15, zero_cross_thresh=0.25):
 
         # %% Get Autocorrelation and solve for LPCs
         corr_half_idx = fit_data.shape[0] // 2
-        corr = sig.correlate(in1=fit_data,
-                             in2=fit_data,
-                             mode='same')[corr_half_idx:]
+        corr = scisig.correlate(in1=fit_data,
+                                in2=fit_data,
+                                mode='same')[corr_half_idx:]
         c = corr[:lpc_order]  # col and row of autocorr toeplitz matrix
         b = corr[1:lpc_order+1]
 
@@ -151,8 +151,28 @@ def lpc(data, frame_len, overlap_len, lpc_order=15, zero_cross_thresh=0.25):
         zero_cross_rate = get_zero_cross_rate(fit_data)
         is_voiced[ifr] = zero_cross_rate < zero_cross_thresh
         
+        
+        # log_power_spectrum = 10*np.log10(np.abs(np.fft.fft(fit_data))**2)
+        # cepstrum = np.fft.ifft(log_power_spectrum)[:log_power_spectrum.shape[0]//2]
+        # pitch_period[ifr] = np.maximum(np.argmax(cepstrum[1:]), 3)  # don't include sample 0; 3 is least freq for safety
+        # is_debug = False
+        # if is_debug:
+        #     plt.figure(1, clear=True)
+        #     plt.subplot(1, 2, 1)
+        #     plt.plot(np.fft.fftshift(log_power_spectrum))
+        #     plt.title('Log Power Spectrum')
+        #     plt.grid()
+        #     plt.xlabel('Frequency - fs/N')
+        #     plt.ylabel('Power (dB)')
+            
+        #     plt.subplot(1, 2, 2)
+        #     plt.plot(cepstrum)
+        #     plt.title('Cepstrum')
+        #     plt.grid()
+        #     plt.xlabel('Quefrency - Samples')
+        #     plt.ylabel('Value')
+
         min_period = 4  # 4kHz ish
-        # max_period = 
         pitch_period[ifr] = (np.argmax(corr[min_period:]) + min_period)  # in samples
         
         # Use pseudo-inverse since solve_toeplitz becomes singular
@@ -169,14 +189,14 @@ def lpc(data, frame_len, overlap_len, lpc_order=15, zero_cross_thresh=0.25):
         s = data[frame_st - lpc_order:frame_end]  # True speech signal for frame (take lpc_order extra for prediction)
         num = np.concatenate((np.array([0]), x), axis=0) # y(n) = 0x(n) + a1x(n-1) + a2x(n-2) + ...
         den = np.array([1])
-        s_hat = sig.lfilter(b=num, a=den, x=s)
+        s_hat = scisig.lfilter(b=num, a=den, x=s)
 
         exc_sig = s - s_hat
         
         # %% Get gain and pitch? TODO
         n_exc_samps = exc_sig.shape[0]
         corr_half_idx = n_exc_samps // 2
-        exc_corr = sig.correlate(in1=exc_sig, in2=exc_sig, mode='same')[corr_half_idx:]  # from t=0 onward by 1 sample step
+        exc_corr = scisig.correlate(in1=exc_sig, in2=exc_sig, mode='same')[corr_half_idx:]  # from t=0 onward by 1 sample step
         t_axis = np.arange(n_exc_samps // 2)
         
         frame_gain = np.sqrt(get_energy(exc_sig))
@@ -230,7 +250,7 @@ def lpc(data, frame_len, overlap_len, lpc_order=15, zero_cross_thresh=0.25):
             # first lpc_order predictions are not good since insufficient data
             vocal_filt_num = np.array([1])
             vocal_filt_den = np.concatenate((np.array([1]), -x), axis=0)
-            reconstruct = sig.lfilter(b=vocal_filt_num, a=vocal_filt_den, x=exc_sig)
+            reconstruct = scisig.lfilter(b=vocal_filt_num, a=vocal_filt_den, x=exc_sig)
 
             plt.figure(3, clear=True)
             plt.plot(reconstruct[lpc_order:], 'r-o', label='Reconstruction', fillstyle='none')
@@ -292,7 +312,7 @@ def reconstruct_lpc(exc_sig_per_frame, lpc_coeffs, gain, frame_len, overlap_len)
             excitation = gain[ifr] * exc_sig_per_frame[ifr, :]
 
         # TODO-KT: do i need to take lpc_order extra samples of exc_sig?
-        reconstruct = sig.lfilter(b=vocal_filt_num, a=vocal_filt_den, x=excitation)
+        reconstruct = scisig.lfilter(b=vocal_filt_num, a=vocal_filt_den, x=excitation)
         reconstruct_sig[ifr, :] = reconstruct[lpc_order:]
     return reconstruct_sig
 
@@ -365,7 +385,7 @@ def is_voiced(signal):
         True if input signal is voiced, false if unvoiced
     """
     corr_half_idx = signal.shape[0] // 2
-    corr = sig.correlate(in1=signal,
+    corr = scisig.correlate(in1=signal,
                          in2=signal,
                          mode='same')[corr_half_idx:]
     plt.figure(1, clear=True)

@@ -32,7 +32,8 @@ random.shuffle(fullfiles)
 #   `base` - base LPC using quantization on excitation signal
 #   'parameterize' - parameterize the excitation using pitch period and reconstruct it at decoder
 #   'vq' - vector quantization of excitation signal
-method = 'parameterize'
+#   'autoencoder' - Use autoencoder to encode and decode excitation signal
+method = 'autoencoder'
 
 LpcConfig = {'order': 10,
              'overlap_time': 10e-3,
@@ -41,13 +42,19 @@ LpcConfig = {'order': 10,
 TransmitData = {}
 if method == 'base':
     TransmitData = {'lpccs': [], 'excitations': [], 'gains': []}
-    QuantizeConfig = {'n_bit_lpccs': 14, 'n_bit_excitations': 12, 'n_bit_gains': 12}
+    QuantizeConfig = {'n_bit_lpccs': 14, 'n_bit_excitations': 6, 'n_bit_gains': 12}
+
 elif method == 'vq':
     TransmitData = {'lpccs': [], 'vq_index': [], 'gains': []}
-    QuantizeConfig = {'n_bit_lpccs': 14, 'n_bit_vq_index': 8, 'n_bit_gains': 12}
+    QuantizeConfig = {'n_bit_lpccs': 14, 'n_bit_vq_index': 10, 'n_bit_gains': 12}
+
 elif method == 'parameterize':
     TransmitData = {'lpccs': [], 'pitch_periods': [], 'is_voiceds': [], 'gains': []}
     QuantizeConfig = {'n_bit_lpccs': 14, 'n_bit_pitch_periods': 6, 'n_bit_is_voiceds': 1, 'n_bit_gains': 12}
+
+elif method == 'autoencoder':
+    TransmitData = {'lpccs': [], 'gains': []}
+    QuantizeConfig = {'n_bit_lpccs': 14, 'n_bit_gains': 12, 'n_bit_encodings': 12}  # 12 bits used in GoogleColab script
 
 # Original signal
 n_bit_orig = 16
@@ -57,9 +64,10 @@ max_val = 0.8  # normalize audio -0.8 to 0.8
 z_cross_thresh = 0.25  # anything above is unvoiced
 
 # %% Encoder
-# Data transmitted to decoder
+# Original data stored here
 OrigData = {'signals': []}
 
+# LPC parameters stored here
 lpccs = []
 excitations = []
 gains = []
@@ -105,7 +113,7 @@ for ii, fullfile in enumerate(fullfiles):
         plt.plot(data, 'k-', label='Speech Signal')
         plt.plot(z_cross_rate, 'r-', label='Zero-Crossing Rate')
         plt.plot(energy / window_size, 'c-', label='Energy per Sample')
-        plt.plot(np.array([0, data.size-1]), np.ones((2,)) * z_cross_thresh, 'g-*', label='Zero-Crossings Voiced/Unvoiced Threshold')
+        #plt.plot(np.array([0, data.size-1]), np.ones((2,)) * z_cross_thresh, 'g-*', label='Zero-Crossings Voiced/Unvoiced Threshold')
         plt.legend()
         plt.grid()
         plt.title('Speech Signal vs. Voiced Detector Parameters')
@@ -134,12 +142,13 @@ for ii, fullfile in enumerate(fullfiles):
 
 is_save = False
 if is_save:
-    np.save('excitations', np.concatenate('excitations', axis=0))
+    np.save('excitations', np.concatenate(excitations, axis=0))
     
 # %% Quantize LPC Parameters
 # 1) Setup Quantization
 # Excitations
 if method == 'vq':
+    pass
     excitations_array = np.concatenate(excitations, axis=0)
     vq_index = []
     n_vectors = 2**QuantizeConfig['n_bit_vq_index']  # num vectors in codebook; power of 2
@@ -211,6 +220,15 @@ elif method == 'vq':
 elif method == 'parameterize':
     TransmitData['pitch_periods'] = pitch_periods
     TransmitData['is_voiceds'] = is_voiceds
+elif method == 'autoencoder':
+    encoding = np.load('encodings_post_quantize.npy')
+    encodings = []
+    ifr = 0
+    for i_file in range(n_files):
+        n_frames_in_file = lpccs[i_file].shape[0]
+        encodings.append(encoding[ifr:ifr + n_frames_in_file, :])
+        ifr += n_frames_in_file
+    TransmitData['encodings'] = encodings
 
 # %% Entropies
 print('\n ****** ENTROPY ******')
@@ -249,6 +267,11 @@ for ii, (key, val) in enumerate(TransmitData.items()):
 # %% Decoder
 ReconstructData = {'signals': []}
 
+# Encoding/quantization/decoding done in Google Colab script
+if method == 'autoencoder':
+    decoding = np.load('decodings.npy')
+    ifr = 0
+
 for ii in range(n_files):
     lpccs = TransmitData['lpccs'][ii]
     gains = TransmitData['gains'][ii]
@@ -267,11 +290,19 @@ for ii in range(n_files):
         pitch_periods = TransmitData['pitch_periods'][ii]
         is_voiceds = TransmitData['is_voiceds'][ii]
         excitations = np.zeros((n_frame, n_samps_per_frame))
-        for ii, (period, is_voiced) in enumerate(zip(pitch_periods, is_voiceds)):
+        for jj, (period, is_voiced) in enumerate(zip(pitch_periods, is_voiceds)):
             if is_voiced:
-                excitations[ii, :] = ap.gen_deltas(n_samps=n_samps_per_frame, period=period)
+                excitations[jj, :] = ap.gen_deltas(n_samps=n_samps_per_frame, period=period)
             else:
-                excitations[ii, :] = np.random.randn(n_samps_per_frame)
+                excitations[jj, :] = np.random.randn(n_samps_per_frame)
+    elif method == 'autoencoder':
+        n_frames_in_file = lpccs.shape[0]
+        excitations = decoding[ifr:ifr + n_frames_in_file, :]
+        
+        for f, gain in enumerate(gains):
+            frame_gain = np.sqrt(ap.get_energy(excitations[f, :]))
+            excitations[f, :] /= frame_gain
+        ifr += n_frames_in_file
     
     reconstruct_sig = ap.reconstruct_lpc(exc_sig_per_frame=excitations,
                                          lpc_coeffs=lpccs,
@@ -284,7 +315,7 @@ for ii in range(n_files):
 # %% Analyze Reconstruction Error
 is_hear_reconstruct = True  # listen to every Nth speaker reconstructed
 is_show_reconstruct = False  # show reconstruction plot
-n_listens = 3  # how many random reconstructions to play
+n_listens = 1  # how many random reconstructions to play
 random_listens = np.random.randint(low=0, high=n_files, size=(n_listens,))
 
 reconstruct_error = []
@@ -298,7 +329,6 @@ for ii, (reconstruct_sig, orig_sig) in enumerate(zip(ReconstructData['signals'],
     n_long = reconstruct_sig.shape[0]  # reconstruction stops short of end of data
     orig_sig = orig_sig[n_front:n_front + n_long]  
     reconstruct_error.append(orig_sig - reconstruct_sig)
-
     if is_show_reconstruct:
         plt.figure(6, clear=True)
         plt.plot(orig_sig, 'b-o', fillstyle='none', label='Original')
@@ -310,7 +340,7 @@ for ii, (reconstruct_sig, orig_sig) in enumerate(zip(ReconstructData['signals'],
         plt.grid(True)
         plt.legend()
         plt.pause(0.5)
-    
+
     # Play True and Predicted
     if is_hear_reconstruct and (ii in random_listens):
         recording_length = n_long * samp_period
